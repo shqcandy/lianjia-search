@@ -1,0 +1,2 @@
+listing_id,city,district,community_id,community_name,build_year,build_date,layout,area_sqm,total_price_wan,unit_price_yuan_sqm,floor_desc,orientation,has_elevator,house_nature,large_property,status,source,observed_at
+demo-001,北京,海淀区,demo-community-001,示例小区,2020,,2室1厅,89.5,450,50279,中楼层(共18层),南,有,商品房,是,在售,授权数据或手工整理,2026-10-06
