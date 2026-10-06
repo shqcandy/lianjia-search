@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from datetime import date
@@ -5,10 +6,39 @@ from pathlib import Path
 
 import pandas as pd
 
+import beike_collect
 import lianjia_search as search
 
 
 class PipelineTest(unittest.TestCase):
+    def test_parses_all_official_listing_blocks(self) -> None:
+        first = {
+            "摘要信息": {
+                "交易信息": "70年产权",
+                "价格信息": "总价299万，单价约100000元/平米",
+                "区位交通": "位于东城区崇文门板块兴隆都市馨园小区",
+                "小区信息": "兴隆都市馨园(小区ID:1001)，2004年建成(楼龄22年)",
+                "户型信息": "1室1厅1厨1卫，建筑面积39㎡，朝向南",
+                "房源所在楼层信息": "中楼层",
+            }
+        }
+        second = {
+            "摘要信息": {
+                "交易信息": "70年产权",
+                "价格信息": "总价298万，单价约60000元/平米",
+                "区位交通": "位于西城区广安门板块远见名苑小区",
+                "小区信息": "远见名苑(小区ID:1002)，2007年建成(楼龄19年)",
+                "户型信息": "2室1厅1厨1卫，建筑面积57㎡，朝向北",
+                "房源所在楼层信息": "高楼层",
+            }
+        }
+        text = (
+            f"<房源>\n<101>\n{json.dumps(first, ensure_ascii=False)}\n</101>\n"
+            f"<202>\n{json.dumps(second, ensure_ascii=False)}\n</202>\n</房源>"
+        )
+        rows = beike_collect.parse_listings(text)
+        self.assertEqual(["101", "202"], [row["listing_id"] for row in rows])
+
     def test_boundaries_grouping_and_excel_output(self) -> None:
         rows = [
             self.row("a1", "海淀区", "10", "300", "2016", "有", "是", "在售"),

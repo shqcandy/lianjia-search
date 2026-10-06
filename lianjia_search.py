@@ -7,6 +7,7 @@ import argparse
 import math
 import re
 from collections import Counter
+from collections.abc import Iterable
 from datetime import date
 from pathlib import Path
 
@@ -100,6 +101,11 @@ def normalize_place(value: object) -> str:
     return re.sub(r"[市区]$", "", str(value).strip())
 
 
+def normalize_place_set(value: str | Iterable[str]) -> set[str]:
+    values = value.split(",") if isinstance(value, str) else value
+    return {normalize_place(item) for item in values if str(item).strip()}
+
+
 def subtract_years(day: date, years: int) -> date:
     try:
         return day.replace(year=day.year - years)
@@ -134,7 +140,7 @@ def filter_listings(
     min_total_price: float,
     max_total_price: float,
     city: str,
-    district: str,
+    district: str | Iterable[str],
 ) -> tuple[pd.DataFrame, Counter[str]]:
     validate_columns(frame)
     result = frame.copy()
@@ -165,7 +171,9 @@ def filter_listings(
 
     checks = {
         "city": result["city"].map(normalize_place).eq(normalize_place(city)),
-        "district": result["district"].map(normalize_place).eq(normalize_place(district)),
+        "district": result["district"].map(normalize_place).isin(
+            normalize_place_set(district)
+        ),
         "age": known_build_date | known_year,
         "price": result["_total_price"].between(
             min_total_price, max_total_price, inclusive="both"
@@ -291,7 +299,7 @@ def run_pipeline(
     min_total_price: float = 300,
     max_total_price: float = 500,
     city: str = "北京",
-    district: str = "海淀",
+    district: str | Iterable[str] = "海淀",
 ) -> Counter[str]:
     source = read_source(input_path)
     filtered, stats = filter_listings(
@@ -320,7 +328,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-total-price", type=float, default=300)
     parser.add_argument("--max-total-price", type=float, default=500)
     parser.add_argument("--city", default="北京")
-    parser.add_argument("--district", default="海淀")
+    parser.add_argument(
+        "--district",
+        action="append",
+        help="行政区，可重复指定；默认海淀",
+    )
     return parser.parse_args()
 
 
@@ -334,7 +346,7 @@ def main() -> None:
         min_total_price=args.min_total_price,
         max_total_price=args.max_total_price,
         city=args.city,
-        district=args.district,
+        district=args.district or ["海淀"],
     )
     print(
         "完成: "
