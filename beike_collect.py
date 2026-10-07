@@ -11,7 +11,7 @@ import re
 import subprocess
 import time
 from collections import deque
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +34,14 @@ PRICE_BINS = (
     (300, 325),
     (325, 350),
 )
+
+MIN_REQUEST_INTERVAL_SECONDS = 60
+RATE_LIMIT_WINDOWS = (
+    (5 * 60, 1),
+    (60 * 60, 3),
+    (24 * 60 * 60, 10),
+)
+SERVICE_UNAVAILABLE_COOLDOWNS = (6 * 60 * 60, 24 * 60 * 60, 72 * 60 * 60)
 
 OUTPUT_COLUMNS = [
     "listing_id",
@@ -62,15 +70,126 @@ class CollectionError(RuntimeError):
     """Raised when official results cannot be collected safely."""
 
 
+class RateLimitPause(CollectionError):
+    """Raised when the persisted client-side rate limit requires a pause."""
+
+    def __init__(self, message: str, next_allowed_at: float):
+        super().__init__(message)
+        self.next_allowed_at = next_allowed_at
+
+    @property
+    def next_allowed_iso(self) -> str:
+        return datetime.fromtimestamp(
+            self.next_allowed_at, tz=timezone.utc
+        ).isoformat()
+
+
+def rate_limit_pause(
+    request_times: list[float], now: float
+) -> float | None:
+    next_allowed = 0.0
+    for window, limit in RATE_LIMIT_WINDOWS:
+        recent = sorted(value for value in request_times if now - value < window)
+        if len(recent) >= limit:
+            next_allowed = max(
+                next_allowed,
+                recent[len(recent) - limit] + window,
+            )
+    return next_allowed or None
+
+
+class RateLimiter:
+    """Persist request timestamps and enforce conservative client-side limits."""
+
+    def __init__(self, state_path: Path):
+        self.state_path = state_path
+        self.state = self._load()
+
+    def _load(self) -> dict[str, Any]:
+        if not self.state_path.exists():
+            return {"requests": [], "failure_streak": 0, "cooldown_until": 0}
+        try:
+            state = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {"requests": [], "failure_streak": 0, "cooldown_until": 0}
+        state.setdefault("requests", [])
+        state.setdefault("failure_streak", 0)
+        state.setdefault("cooldown_until", 0)
+        return state
+
+    def _save(self) -> None:
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        self.state_path.write_text(
+            json.dumps(self.state, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def before_request(self) -> None:
+        now = time.time()
+        cooldown_until = float(self.state.get("cooldown_until") or 0)
+        if cooldown_until > now:
+            raise RateLimitPause(
+                "服务不可用冷却期尚未结束",
+                cooldown_until,
+            )
+
+        day_ago = now - RATE_LIMIT_WINDOWS[-1][0]
+        self.state["requests"] = [
+            float(value)
+            for value in self.state["requests"]
+            if float(value) >= day_ago
+        ]
+        paused_until = rate_limit_pause(self.state["requests"], now)
+        if paused_until:
+            raise RateLimitPause("客户端滚动窗口限制已触发", paused_until)
+
+        if self.state["requests"]:
+            earliest = max(
+                now,
+                float(self.state["requests"][-1]) + MIN_REQUEST_INTERVAL_SECONDS,
+            )
+            if earliest > now:
+                time.sleep(earliest - now)
+
+        self.state["requests"].append(time.time())
+        self._save()
+
+    def record_success(self) -> None:
+        self.state["failure_streak"] = 0
+        self._save()
+
+    def record_service_unavailable(self) -> RateLimitPause:
+        streak = int(self.state.get("failure_streak") or 0) + 1
+        cooldown = SERVICE_UNAVAILABLE_COOLDOWNS[
+            min(streak - 1, len(SERVICE_UNAVAILABLE_COOLDOWNS) - 1)
+        ]
+        next_allowed_at = time.time() + cooldown
+        self.state["failure_streak"] = streak
+        self.state["cooldown_until"] = next_allowed_at
+        self._save()
+        return RateLimitPause(
+            f"官方服务不可用；连续失败 {streak} 次，进入冷却",
+            next_allowed_at,
+        )
+
+
 def number(value: str) -> float | None:
     match = re.search(r"-?\d+(?:\.\d+)?", value.replace(",", ""))
     return float(match.group()) if match else None
 
 
-def run_search(district: str, low: float, high: float, layout: str = "") -> str:
+def run_search(
+    district: str,
+    low: float,
+    high: float,
+    layout: str = "",
+    limiter: RateLimiter | None = None,
+) -> str:
     key = os.environ.get("BEIKE_MCP_API_KEY")
     if not key:
         raise CollectionError("BEIKE_MCP_API_KEY 未注入当前查询进程")
+    if limiter:
+        limiter.before_request()
 
     query = (
         f"{district} 建成时间{MAX_AGE_CUTOFF_TEXT} "
@@ -103,6 +222,8 @@ def run_search(district: str, low: float, high: float, layout: str = "") -> str:
     if completed.returncode:
         raise CollectionError(completed.stderr.strip() or completed.stdout.strip())
     if "service temporarily unavailable" in completed.stdout.lower():
+        if limiter:
+            raise limiter.record_service_unavailable()
         raise CollectionError("贝壳官方服务暂时不可用，已停止本轮查询")
     try:
         payload = json.loads(completed.stdout)
@@ -113,6 +234,8 @@ def run_search(district: str, low: float, high: float, layout: str = "") -> str:
     if not payload.get("ok"):
         detail = payload.get("error") or payload.get("message") or payload
         raise CollectionError(f"贝壳 CLI 返回 ok=false: {detail}")
+    if limiter:
+        limiter.record_success()
     return payload["data"]
 
 
@@ -231,15 +354,21 @@ def parse_listings(text: str) -> list[dict[str, Any]]:
 def collect_district(
     district: str,
     *,
-    delay_seconds: float,
     max_queries: int,
     cache_dir: Path,
-) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], list[tuple[float, float]]]:
+    limiter: RateLimiter,
+) -> tuple[
+    dict[str, dict[str, Any]],
+    list[dict[str, Any]],
+    list[tuple[float, float, str]],
+    RateLimitPause | None,
+]:
     queue = deque((low, high, "") for low, high in PRICE_BINS)
     matches: dict[str, dict[str, Any]] = {}
     incomplete: list[dict[str, Any]] = []
     query_count = 0
     pending: list[tuple[float, float, str]] = []
+    pause: RateLimitPause | None = None
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     while queue:
@@ -253,13 +382,18 @@ def collect_district(
                 queue.appendleft((low, high, layout))
                 pending = list(queue)
                 break
-            text = run_search(district, low, high, layout)
+            try:
+                text = run_search(district, low, high, layout, limiter)
+            except RateLimitPause as error:
+                queue.appendleft((low, high, layout))
+                pending = list(queue)
+                pause = error
+                break
             cache_file.write_text(
                 json.dumps({"data": text}, ensure_ascii=False),
                 encoding="utf-8",
             )
             query_count += 1
-            time.sleep(delay_seconds)
 
         total, actual_low, actual_high = parse_exact_conditions(
             text, district, low, high, layout
@@ -276,11 +410,12 @@ def collect_district(
 
         if total <= 10:
             continue
-        if high - low <= 1:
-            if not layout:
-                for fallback in ("一居室", "二居室", "三居室及以上"):
-                    queue.append((low, high, fallback))
-                continue
+        if high - low <= 1 and not layout:
+            for fallback in ("一居室", "二居室", "三居室及以上"):
+                queue.append((low, high, fallback))
+            continue
+
+        if high - low <= 0.1:
             incomplete.append(
                 {
                     "district": district,
@@ -292,11 +427,15 @@ def collect_district(
             )
             continue
 
-        midpoint = math.floor((low + high) / 2)
+        midpoint = (
+            (low + high) / 2
+            if high - low <= 1
+            else math.floor((low + high) / 2)
+        )
         queue.appendleft((midpoint, high, layout))
         queue.appendleft((low, midpoint, layout))
 
-    return matches, incomplete, pending
+    return matches, incomplete, pending, pause
 
 
 def parse_args() -> argparse.Namespace:
@@ -310,17 +449,23 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="可重复指定；默认东西城",
     )
-    parser.add_argument("--delay", type=float, default=0.8)
     parser.add_argument(
         "--max-queries",
         type=int,
-        default=8,
-        help="每轮最多发起的官方查询数；缓存命中不计入",
+        default=2,
+        choices=range(1, 5),
+        help="每轮最多发起的官方查询数；缓存命中不计入（1-4）",
     )
     parser.add_argument(
         "--cache-dir",
         type=Path,
         default=Path("output/beike_cache"),
+    )
+    parser.add_argument(
+        "--state-file",
+        type=Path,
+        default=Path("output/beike_rate_limit.json"),
+        help="持久化滚动窗口和冷却状态，不包含 API Key",
     )
     parser.add_argument(
         "--csv",
@@ -346,18 +491,21 @@ def main() -> None:
     all_records: dict[str, dict[str, Any]] = {}
     incomplete: list[dict[str, Any]] = []
     pending: dict[str, list[tuple[float, float, str]]] = {}
+    pause: RateLimitPause | None = None
+    limiter = RateLimiter(args.state_file)
 
     for district in districts:
-        records, unresolved, district_pending = collect_district(
+        records, unresolved, district_pending, district_pause = collect_district(
             district,
-            delay_seconds=args.delay,
             max_queries=args.max_queries,
             cache_dir=args.cache_dir,
+            limiter=limiter,
         )
         all_records.update(records)
         incomplete.extend(unresolved)
-        if district_pending:
+        if district_pending or district_pause:
             pending[district] = district_pending
+            pause = district_pause
             break
 
     frame = pd.DataFrame(all_records.values(), columns=OUTPUT_COLUMNS)
@@ -376,6 +524,8 @@ def main() -> None:
                     for district, ranges in pending.items()
                 },
                 "status": "paused" if pending else "complete",
+                "pause_reason": str(pause) if pause else None,
+                "next_allowed_at": pause.next_allowed_iso if pause else None,
             },
             ensure_ascii=False,
             indent=2,
@@ -383,10 +533,16 @@ def main() -> None:
         encoding="utf-8",
     )
     if pending:
-        print(
-            "本轮达到查询预算，已保存缓存；等待限流窗口后再次运行即可续跑",
-            flush=True,
-        )
+        if pause:
+            print(
+                f"{pause}；最早可重试时间 {pause.next_allowed_iso}",
+                flush=True,
+            )
+        else:
+            print(
+                "本轮达到查询预算，已保存缓存；等待后再次运行即可续跑",
+                flush=True,
+            )
         return
 
     run_pipeline(

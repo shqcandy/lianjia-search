@@ -11,6 +11,21 @@ import lianjia_search as search
 
 
 class PipelineTest(unittest.TestCase):
+    def test_rate_limit_calculates_next_allowed_time(self) -> None:
+        now = 1_000_000.0
+        self.assertIsNone(beike_collect.rate_limit_pause([], now))
+        self.assertEqual(
+            now - 10 + 300,
+            beike_collect.rate_limit_pause([now - 10], now),
+        )
+        self.assertEqual(
+            now - 30 + 3600,
+            beike_collect.rate_limit_pause(
+                [now - 10, now - 20, now - 30],
+                now,
+            ),
+        )
+
     def test_parses_all_official_listing_blocks(self) -> None:
         first = {
             "摘要信息": {

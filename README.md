@@ -65,3 +65,16 @@ python -m unittest -v
 ```
 
 测试覆盖 300/500 万边界、2016 年楼龄边界、未知字段排除、区县/在售过滤和 Excel 双 Sheet 输出。
+
+## 贝壳官方 CLI 查询
+
+`beike_collect.py` 只调用已授权的官方 CLI，不读取浏览器 Cookie。当前客户端限制为每 5 分钟 1 次、每小时 3 次、每天 10 次真实请求，缓存命中不消耗额度。
+
+```powershell
+python beike_collect.py `
+  --district 东城区 `
+  --district 西城区 `
+  --max-queries 2
+```
+
+遇到 `service temporarily unavailable` 后会写入持久化冷却时间，并直接停在缓存断点。官方没有公布精确数值配额；限制依据见 [贝壳接口限流核验](docs/beike-rate-limits.md)。
