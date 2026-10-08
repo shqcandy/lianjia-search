@@ -281,7 +281,9 @@ def parse_exact_conditions(
     if not price_match:
         raise CollectionError(f"价格条件没有被精确覆盖: {price_condition or '缺失'}")
     actual_low, actual_high = map(float, price_match.groups())
-    if not math.isclose(actual_low, low) or not math.isclose(actual_high, high):
+    # 官方 CLI 会把总价边界四舍五入到 3 位小数（0.001 万元），
+    # 因此这里用与舍入精度匹配的容差比对，而不是精确相等。
+    if abs(actual_low - low) > 1e-3 or abs(actual_high - high) > 1e-3:
         raise CollectionError(
             f"价格条件被改写: 期望 [{low}, {high}]，实际 [{actual_low}, {actual_high}]"
         )
